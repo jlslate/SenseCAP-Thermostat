@@ -73,6 +73,8 @@ metadata {
         input name: "colorOff",     type: "enum", title: "Color -- Off",       options: colorOptions(), defaultValue: "#303030", required: true
         input name: "colorIdle",    type: "enum", title: "Color -- Idle",      options: colorOptions(), defaultValue: "#606060", required: true
 
+        input name: "backlightTimeout", type: "number",
+              title: "Backlight off after (seconds, 0 = never)", defaultValue: 0, required: true
         input name: "logLevel", type: "enum", title: "Logging Level",
               options: ["0":"None","1":"Info only","2":"Info + Debug"], defaultValue: "1", required: true
     }
@@ -223,6 +225,7 @@ def parse(String description) {
         if (actualNode != configNode) return
         if (msg.payload?.trim() == "online") {
             infoLog "[Thermostat] Display rebooted -- pushing layout"
+            state.pushInProgress = false
             runIn(5, "pushLayout")
         }
         return
@@ -237,9 +240,14 @@ def parse(String description) {
             def json = new groovy.json.JsonSlurper().parseText(msg.payload)
             if (json.uptime == null) return
             int uptime = (json.uptime) as int
-            if (uptime < 30) {
-                infoLog "[Thermostat] Display rebooted (uptime ${uptime}s) -- pushing layout"
-                runIn(5, "pushLayout")
+            if (uptime < 15) {
+                // Only push if we haven't pushed in the last 30 seconds
+                long lastPush = (state.lastPushMs ?: 0L) as long
+                if (now() - lastPush > 30000) {
+                    infoLog "[Thermostat] Display rebooted (uptime ${uptime}s) -- pushing layout"
+                    state.pushInProgress = false
+                    runIn(5, "pushLayout")
+                }
             } else {
                 infoLog "[Thermostat] Display woke from idle -- resyncing"
                 runIn(2, "resyncDisplay")
@@ -269,13 +277,13 @@ def parse(String description) {
         // If screen was off, first tap only wakes the backlight -- don't act on it
         if (!(state.screenOn)) {
             state.screenOn = true
+            scheduleBacklightOff()
             String node = settings.haspNode ?: "plate"
             safePub("hasp/" + node + "/command/backlight", '{"state":"on","brightness":255}')
             scheduleBacklightOff()
             debugLog "[Thermostat] First tap -- waking display"
             return
         }
-        scheduleBacklightOff()
         handleButtonTap(msg.topic, msg.payload)
     }
 }
@@ -301,6 +309,7 @@ private void handleButtonTap(String topic, String payload) {
 // ── Layout push ────────────────────────────────────────────────────────────────
 
 def pushLayout() {
+    if (state.pushInProgress) { infoLog "[Thermostat] pushLayout already in progress -- skipping"; return }
     boolean mqttUp = false
     try { mqttUp = interfaces.mqtt.isConnected() } catch (Exception e) { mqttUp = false }
     if (!mqttUp) {
@@ -308,6 +317,8 @@ def pushLayout() {
         runIn(10, "pushLayout")
         return
     }
+    state.pushInProgress = true
+    state.lastPushMs = now()
 
     String node = settings.haspNode ?: "plate"
     infoLog "[Thermostat] Pushing thermostat layout"
@@ -342,6 +353,11 @@ def pushLayout() {
 
     // Push thermostat data after display has rendered layout
     runIn(3, "resyncDisplay")
+    runIn(5, "clearPushInProgress")
+}
+
+def clearPushInProgress() {
+    state.pushInProgress = false
 }
 
 // ── Thermostat display update ──────────────────────────────────────────────────
@@ -368,12 +384,6 @@ def updateThermostatDisplay(data) {
     pushThermostatTile(settings.haspNode ?: "plate", temp, heat, cool, mode, opState, away)
 }
 
-private void setBacklightTimeout(seconds) {
-    int secs = (seconds != null ? seconds : 0) as int
-    state.backlightTimeout = secs
-    infoLog "[Thermostat] Backlight timeout set to ${secs}s"
-}
-
 def backlightOff() {
     String node = settings.haspNode ?: "plate"
     safePub("hasp/${node}/command/backlight", '{"state":"off"}')
@@ -382,7 +392,7 @@ def backlightOff() {
 }
 
 private void scheduleBacklightOff() {
-    int secs = (state.backlightTimeout != null ? state.backlightTimeout : 0) as int
+    int secs = (settings.backlightTimeout != null ? settings.backlightTimeout : 0) as int
     unschedule("backlightOff")
     if (secs > 0) runIn(secs, "backlightOff")
 }
@@ -405,13 +415,30 @@ private void pushThermostatTile(String node, String temp, String heat, String co
     // Tile 1: current temp + descriptive second line
     // Line 2 reflects actual operating state, not just mode
     String line2
-    // Prefer opState when available, fall back to mode for devices that don't report operatingState
-    if (opState == "heating" || ((!opState || opState == "idle") && mode == "heat")) {
+    // Determine if actively heating/cooling based on mode, opState, and temp vs setpoint
+    boolean activeHeat = (opState == "heating") ||
+                         (mode == "heat" && (!opState || opState == "idle" || opState == ""))
+    boolean activeCool = (opState == "cooling") ||
+                         (mode == "cool" && (!opState || opState == "idle" || opState == ""))
+    // If temp has already passed setpoint, show idle state regardless
+    try {
+        BigDecimal t = temp as BigDecimal
+        BigDecimal h = heat as BigDecimal
+        BigDecimal c = cool as BigDecimal
+        if (activeHeat && t >= h) activeHeat = false
+        if (activeCool && t <= c) activeCool = false
+    } catch (Exception e) { }
+
+    if (activeHeat) {
         line2 = "Heating to " + heat + "\u00B0"
-    } else if (opState == "cooling" || ((!opState || opState == "idle") && mode == "cool")) {
+    } else if (activeCool) {
         line2 = "Cooling to " + cool + "\u00B0"
     } else if (opState == "fan only") {
         line2 = "Fan only"
+    } else if (mode == "heat") {
+        line2 = "Heat: " + heat + "\u00B0"
+    } else if (mode == "cool") {
+        line2 = "Cool: " + cool + "\u00B0"
     } else {
         line2 = "Off"
     }
