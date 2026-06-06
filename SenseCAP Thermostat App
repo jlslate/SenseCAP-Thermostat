@@ -57,7 +57,7 @@ def mainPage() {
         }
         section("Display Device") {
             input name: "displayDevice",
-                  type: "device.SenseCAP Thermostat",
+                  type: "device.SenseCAPThermostat",
                   title: "openHASP Thermostat device",
                   required: true,
                   multiple: false
@@ -82,8 +82,6 @@ def mainPage() {
             input name: "varHereLow",  type: "text", title: "Home Low variable name",   defaultValue: "main bedroom here low", required: true
         }
         section("Options") {
-            input name: "backlightTimeout", type: "number",
-                  title: "Backlight off after (seconds, 0 = never)", defaultValue: 0, required: true
             input name: "logLevel", type: "enum", title: "Logging Level",
                   options: ["0":"None","1":"Info only","2":"Info + Debug"],
                   defaultValue: "1", required: true
@@ -149,10 +147,6 @@ def initialize() {
 
     // Subscribe to location mode changes
     subscribe(location, "mode", modeHandler)
-
-    // Push backlight timeout to driver
-    int bl = (settings.backlightTimeout != null ? settings.backlightTimeout : 0) as int
-    try { settings.displayDevice.setBacklightTimeout(bl) } catch (Exception e) { }
 
     // Periodic sync every minute -- fallback for unreliable attribute subscriptions
     runEvery1Minute("syncDisplay")
